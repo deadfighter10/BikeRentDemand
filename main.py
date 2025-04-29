@@ -1,10 +1,10 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error, r2_score, root_mean_squared_error
+from sklearn.model_selection import train_test_split  # Keep for potential re-use if needed
+from sklearn.ensemble import GradientBoostingRegressor  # Keep model import
+from sklearn.preprocessing import StandardScaler  # Keep scaler import
+from sklearn.metrics import mean_squared_error, r2_score, root_mean_squared_error  # Keep metrics
 import joblib
 import os
 
@@ -13,33 +13,62 @@ st.set_page_config(layout="wide", page_title="Bike Demand Predictor")
 
 # --- Configuration & Constants ---
 DATA_FILE_PATH = "Bike Sharing DC Dataset/day.csv"
-# Use new filenames for the model trained with de-normalized data and without 'yr'
+# Using V2 model/scaler trained with de-normalized data and without 'yr'
 MODEL_FILE_PATH = "gradient_boosting_model_v2.joblib"
 SCALER_FILE_PATH = "scaler_v2.joblib"
-# Add 'yr' to the drop list
-FEATURES_TO_DROP = ["cnt", "instant", "dteday", "casual", "registered", "yr"]
-# Define original scale calculation constants (from dataset documentation)
+FEATURE_NAMES_FILE = "feature_names_v2.joblib"  # File storing feature order
+# Original features dropped during V2 training
+FEATURES_TO_DROP_TRAINING = ["cnt", "instant", "dteday", "casual", "registered", "yr", 'temp', 'atemp', 'hum',
+                             'windspeed']  # Include original normalized weather cols
+# Define original scale calculation constants
 T_MIN, T_MAX = -8, 39
 AT_MIN, AT_MAX = -16, 50
 HUM_MAX = 100
 WIND_MAX = 67
 
 
-# --- Caching Functions ---
+# --- Helper Functions ---
+
+def derive_season(month):
+    """Derives season code (1-4) from month (1-12)."""
+    if month in [12, 1, 2]:
+        return 4  # Winter
+    elif month in [3, 4, 5]:
+        return 1  # Spring
+    elif month in [6, 7, 8]:
+        return 2  # Summer
+    elif month in [9, 10, 11]:
+        return 3  # Fall
+    else:
+        return 1  # Default or error case
+
+
+def derive_workingday(weekday, holiday):
+    """Derives workingday status (0 or 1) from weekday (0-6) and holiday (0/1)."""
+    if holiday == 1:
+        return 0  # Holiday is not a working day
+    elif weekday in [0, 6]:  # 0=Sunday, 6=Saturday
+        return 0  # Weekend is not a working day
+    else:  # Weekdays 1-5 and not a holiday
+        return 1  # It's a working day
+
 
 def denormalize_data(df):
     """Converts normalized weather features back to original scales."""
+    # This function might not be strictly needed anymore if load_and_prepare_data handles it
+    # But keep it for potential standalone use or clarity
     df_copy = df.copy()
     df_copy['temp_c'] = df_copy['temp'] * (T_MAX - T_MIN) + T_MIN
     df_copy['atemp_c'] = df_copy['atemp'] * (AT_MAX - AT_MIN) + AT_MIN
     df_copy['hum_pct'] = df_copy['hum'] * HUM_MAX
     df_copy['windspeed_kmh'] = df_copy['windspeed'] * WIND_MAX
-    # Drop original normalized columns after creating new ones
-    df_copy = df_copy.drop(columns=['temp', 'atemp', 'hum', 'windspeed'])
+    df_copy = df_copy.drop(columns=['temp', 'atemp', 'hum', 'windspeed'], errors='ignore')
     return df_copy
 
 
-@st.cache_data  # Cache the loaded and processed data
+# --- Caching Functions (Load Data, Model, Scaler, Feature Names) ---
+
+@st.cache_data
 def load_and_prepare_data(file_path):
     """Loads, de-normalizes, and prepares the bike sharing data."""
     if not os.path.exists(file_path):
@@ -47,9 +76,7 @@ def load_and_prepare_data(file_path):
         st.stop()
     try:
         data = pd.read_csv(file_path)
-        # De-normalize weather features
         data_processed = denormalize_data(data)
-
         if 'cnt' not in data_processed.columns:
             st.error("Error: 'cnt' column missing after processing.")
             st.stop()
@@ -59,209 +86,191 @@ def load_and_prepare_data(file_path):
         st.stop()
 
 
-@st.cache_resource  # Cache the trained model and scaler
-def load_model_and_scaler(data, features_to_drop):
-    """
-    Trains (if needed) or loads a Gradient Boosting model and scaler,
-    using de-normalized data and excluding 'yr'.
-    """
-    if os.path.exists(MODEL_FILE_PATH) and os.path.exists(SCALER_FILE_PATH):
-        try:
-            model = joblib.load(MODEL_FILE_PATH)
-            scaler = joblib.load(SCALER_FILE_PATH)
-            print("Loaded pre-trained V2 model and scaler.")
-            return model, scaler
-        except Exception as e:
-            st.warning(f"Could not load pre-trained V2 files ({e}). Retraining model...")
-
-    print("Training new V2 model and scaler...")
+@st.cache_resource
+def load_prediction_assets(model_path, scaler_path, features_path):
+    """Loads the trained model, scaler, and feature names."""
+    if not all(os.path.exists(p) for p in [model_path, scaler_path, features_path]):
+        st.error(f"Error: Model/Scaler/Feature file(s) not found. "
+                 f"Please ensure '{model_path}', '{scaler_path}', and '{features_path}' exist. "
+                 "You may need to run the training script first.")
+        st.stop()
     try:
-        # Use the de-normalized data
-        X = data.drop(columns=features_to_drop)
-        y = data["cnt"]
-        # Check if columns to drop actually exist
-        cols_exist = all(item in data.columns for item in features_to_drop if item in X.columns or item == 'cnt')
-        if not cols_exist:
-            st.error(f"Error: Not all columns to drop {features_to_drop} found in data.")
-            st.stop()
-
-        # Ensure feature order is consistent
-        feature_names = X.columns.tolist()
-
-        x_train, x_val, y_train, y_val = train_test_split(
-            X, y, test_size=0.2, random_state=42
-        )
-
-        # --- Scaling ---
-        # Scaler is now fitted on de-normalized data (temp_c, hum_pct etc.)
-        scaler = StandardScaler()
-        x_train_scaled = scaler.fit_transform(x_train)
-        # x_val_scaled = scaler.transform(x_val) # Only needed if evaluating here
-
-        # --- Model Training ---
-        gb_reg = GradientBoostingRegressor(
-            n_estimators=1000, learning_rate=0.1, max_depth=5,
-            random_state=42, subsample=0.7
-        )
-        gb_reg.fit(x_train_scaled, y_train)  # Train on scaled data
-
-        # --- Save the V2 model and scaler ---
-        joblib.dump(gb_reg, MODEL_FILE_PATH)
-        joblib.dump(scaler, SCALER_FILE_PATH)
-        # Also save the feature order used for training
-        joblib.dump(feature_names, "feature_names_v2.joblib")
-
-        # --- Optional: Evaluate and Print Performance ---
-        x_val_scaled = scaler.transform(x_val)  # Scale validation set for evaluation
-        gb_reg_pred = gb_reg.predict(x_val_scaled)
-        mse = mean_squared_error(y_val, gb_reg_pred)
-        r2 = r2_score(y_val, gb_reg_pred)
-        rmse = root_mean_squared_error(y_val, gb_reg_pred)
-        print(f"--- Model V2 Performance (Test Set) ---")
-        print(f"Mean Squared Error: {mse:.2f}")
-        print(f"R2 Score: {r2:.4f}")
-        print(f"Root Mean Squared Error: {rmse:.2f}")
-        print(f"---------------------------------------")
-
-        return gb_reg, scaler
-
+        model = joblib.load(model_path)
+        scaler = joblib.load(scaler_path)
+        feature_names = joblib.load(features_path)
+        print("Loaded V2 model, scaler, and feature names.")
+        return model, scaler, feature_names
     except Exception as e:
-        st.error(f"Error during model training: {e}")
-        st.exception(e)  # Print full traceback to Streamlit console
+        st.error(f"Error loading prediction assets: {e}")
         st.stop()
 
 
-# --- Load Data and Model ---
+# --- Load Assets ---
 data_processed_df = load_and_prepare_data(DATA_FILE_PATH)
-# Load feature names used during training (important for prediction consistency)
-try:
-    FEATURE_ORDER = joblib.load("feature_names_v2.joblib")
-except FileNotFoundError:
-    # If feature names file doesn't exist, try to infer or force retrain
-    st.warning("Feature names file not found. Attempting to infer or retrain.")
-    # Force retrain by ensuring model/scaler files don't exist
-    if os.path.exists(MODEL_FILE_PATH): os.remove(MODEL_FILE_PATH)
-    if os.path.exists(SCALER_FILE_PATH): os.remove(SCALER_FILE_PATH)
-    trained_model, fitted_scaler = load_model_and_scaler(data_processed_df, FEATURES_TO_DROP)
-    # Try loading feature names again after training should have saved them
-    try:
-        FEATURE_ORDER = joblib.load("feature_names_v2.joblib")
-    except FileNotFoundError:
-        st.error("Failed to load feature names even after retraining attempt. Cannot proceed.")
-        st.stop()  # Stop execution if feature names cannot be determined
-
-# Now load the model and scaler
-trained_model, fitted_scaler = load_model_and_scaler(data_processed_df, FEATURES_TO_DROP)
+trained_model, fitted_scaler, FEATURE_ORDER = load_prediction_assets(
+    MODEL_FILE_PATH, SCALER_FILE_PATH, FEATURE_NAMES_FILE
+)
 
 # --- Streamlit App Layout ---
+
 st.title("🚲 Daily Bike Rental Demand Predictor")
 st.markdown("""
-Predict the **total number of daily bike rentals** in Washington D.C. based on weather and seasonal conditions.
-Adjust the inputs in the sidebar to see the estimated demand.
-*(Model: Gradient Boosting Regressor. Note: This model does not consider the specific year.)*
+Predict the **total number of daily bike rentals** based on date and weather conditions.
+Season and working day status are automatically determined from your inputs.
+*(Model: Gradient Boosting Regressor)*
 """)
 
-# --- User Input Section ---
-st.sidebar.header("Input Conditions:")
-
-# Define input mappings for clarity
-season_map = {1: "Spring", 2: "Summer", 3: "Fall", 4: "Winter"}
-# Month names are more user-friendly
+# --- Define Input Mappings ---
 month_map = {1: 'Jan', 2: 'Feb', 3: 'Mar', 4: 'Apr', 5: 'May', 6: 'Jun', 7: 'Jul', 8: 'Aug', 9: 'Sep', 10: 'Oct',
              11: 'Nov', 12: 'Dec'}
 weekday_map = {0: 'Sunday', 1: 'Monday', 2: 'Tuesday', 3: 'Wednesday', 4: 'Thursday', 5: 'Friday', 6: 'Saturday'}
-# Updated weather situation descriptions for clarity
 weather_map = {1: "Clear / Few Clouds", 2: "Mist / Cloudy", 3: "Light Snow / Light Rain",
                4: "Heavy Rain / Thunderstorm / Snow"}
+season_map_display = {1: "Spring", 2: "Summer", 3: "Fall", 4: "Winter"}  # Only for display
 
-# Use de-normalized data ranges for sliders
-temp_c_min, temp_c_max = float(data_processed_df['temp_c'].min()), float(data_processed_df['temp_c'].max())
-atemp_c_min, atemp_c_max = float(data_processed_df['atemp_c'].min()), float(data_processed_df['atemp_c'].max())
-hum_pct_min, hum_pct_max = float(data_processed_df['hum_pct'].min()), float(data_processed_df['hum_pct'].max())
-wind_kmh_min, wind_kmh_max = float(data_processed_df['windspeed_kmh'].min()), float(
-    data_processed_df['windspeed_kmh'].max())
+# --- Define Tabs ---
+tab1, tab2 = st.tabs(["📊 Make Prediction", "Explore Data"])
 
-# Create input widgets with better labels and help text
-inp_season = st.sidebar.selectbox("Season", options=list(season_map.keys()), format_func=lambda x: season_map[x],
-                                  help="Select the season.")
-inp_mnth = st.sidebar.selectbox("Month", options=list(month_map.keys()), format_func=lambda x: month_map[x],
-                                help="Select the month.")
-inp_holiday = st.sidebar.selectbox("Holiday?", options=[0, 1], format_func=lambda x: "No" if x == 0 else "Yes",
-                                   help="Is it a public holiday?")
-inp_weekday = st.sidebar.selectbox("Day of Week", options=list(weekday_map.keys()),
-                                   format_func=lambda x: weekday_map[x], help="Select the day.")
-inp_workingday = st.sidebar.selectbox("Working Day?", options=[0, 1],
-                                      format_func=lambda x: "No (Weekend/Holiday)" if x == 0 else "Yes (Weekday)",
-                                      help="Is it a regular working day (not weekend or holiday)?")
-weather_options = sorted(data_processed_df['weathersit'].unique())
-inp_weathersit = st.sidebar.selectbox("Weather Situation", options=weather_options,
-                                      format_func=lambda x: weather_map.get(x, f"Unknown: {x}"),
+# --- Prediction Tab ---
+with tab1:
+    st.header("Input Conditions for Prediction")
+
+    col1, col2, col3 = st.columns(3)  # Create 3 columns for inputs
+
+    # Column 1: Date related inputs
+    with col1:
+        st.subheader("Date & Day Type")
+        inp_mnth = st.selectbox("Month", options=list(month_map.keys()), format_func=lambda x: month_map[x],
+                                key="pred_month", help="Select the month.")
+        inp_weekday = st.selectbox("Day of Week", options=list(weekday_map.keys()),
+                                   format_func=lambda x: weekday_map[x], key="pred_weekday", help="Select the day.")
+        inp_holiday = st.selectbox("Holiday?", options=[0, 1], format_func=lambda x: "No" if x == 0 else "Yes",
+                                   key="pred_holiday", help="Is it a public holiday?")
+
+    # Column 2: Weather Situation
+    with col2:
+        st.subheader("Weather Overview")
+        weather_options = sorted(data_processed_df['weathersit'].unique())
+        inp_weathersit = st.selectbox("Weather Situation", options=weather_options,
+                                      format_func=lambda x: weather_map.get(x, f"Unknown: {x}"), key="pred_weather",
                                       help="Select the prevailing weather category for the day.")
+        # Display derived season and working day for user confirmation
+        derived_season = derive_season(inp_mnth)
+        derived_workingday = derive_workingday(inp_weekday, inp_holiday)
+        st.write(f"**Derived Season:** {season_map_display[derived_season]}")
+        st.write(f"**Derived Working Day:** {'Yes' if derived_workingday == 1 else 'No'}")
 
-# Use number_input for precise temperature, maybe sliders for others
-st.sidebar.subheader("Weather Details:")
-inp_temp_c = st.sidebar.number_input("Temperature (°C)", min_value=temp_c_min, max_value=temp_c_max,
-                                     value=float(data_processed_df['temp_c'].mean()), step=0.5, format="%.1f",
-                                     help="Average daily temperature in Celsius.")
-inp_atemp_c = st.sidebar.number_input("Feeling Temperature (°C)", min_value=atemp_c_min, max_value=atemp_c_max,
-                                      value=float(data_processed_df['atemp_c'].mean()), step=0.5, format="%.1f",
-                                      help="'Feels like' temperature in Celsius.")
-inp_hum_pct = st.sidebar.slider("Humidity (%)", int(hum_pct_min), int(hum_pct_max),
-                                int(data_processed_df['hum_pct'].mean()), help="Average daily humidity in percent.")
-inp_windspeed_kmh = st.sidebar.slider("Windspeed (km/h)", int(wind_kmh_min), int(wind_kmh_max),
-                                      int(data_processed_df['windspeed_kmh'].mean()),
-                                      help="Average daily windspeed in km/h.")
+    # Column 3: Weather Details (Typed Inputs)
+    with col3:
+        st.subheader("Weather Details")
+        # Get descriptive stats for de-normalized data
+        desc_stats = data_processed_df[FEATURE_ORDER].describe()
 
-# --- Prediction Logic ---
-col1, col2 = st.columns([0.6, 0.4])  # Create columns for layout
+        inp_temp_c = st.number_input(
+            "Temperature (°C)",
+            min_value=round(desc_stats.loc['min', 'temp_c'] - 5, 1),  # Add some buffer
+            max_value=round(desc_stats.loc['max', 'temp_c'] + 5, 1),
+            value=round(desc_stats.loc['mean', 'temp_c'], 1),
+            step=0.5, format="%.1f", key="pred_temp",
+            help="Average daily temperature in Celsius."
+        )
+        inp_atemp_c = st.number_input(
+            "Feeling Temperature (°C)",
+            min_value=round(desc_stats.loc['min', 'atemp_c'] - 5, 1),
+            max_value=round(desc_stats.loc['max', 'atemp_c'] + 5, 1),
+            value=round(desc_stats.loc['mean', 'atemp_c'], 1),
+            step=0.5, format="%.1f", key="pred_atemp",
+            help="'Feels like' temperature in Celsius."
+        )
+        inp_hum_pct = st.number_input(
+            "Humidity (%)",
+            min_value=0.0,  # Humidity min is 0
+            max_value=100.0,
+            value=round(desc_stats.loc['mean', 'hum_pct'], 1),
+            step=0.5, format="%.1f", key="pred_hum",
+            help="Average daily humidity in percent."
+        )
+        inp_windspeed_kmh = st.number_input(
+            "Windspeed (km/h)",
+            min_value=0.0,  # Windspeed min is 0
+            max_value=round(desc_stats.loc['max', 'windspeed_kmh'] + 10, 1),  # Add buffer
+            value=round(desc_stats.loc['mean', 'windspeed_kmh'], 1),
+            step=0.1, format="%.1f", key="pred_wind",
+            help="Average daily windspeed in km/h."
+        )
 
-with col1:
-    st.subheader("Current Input Conditions:")
-    # Create input DataFrame using the loaded FEATURE_ORDER
-    # This ensures consistency between training and prediction
-    input_values = [
-        inp_season, inp_mnth, inp_holiday, inp_weekday, inp_workingday, inp_weathersit,
-        inp_temp_c, inp_atemp_c, inp_hum_pct, inp_windspeed_kmh
-    ]
-    input_data = pd.DataFrame([input_values], columns=FEATURE_ORDER)
-    st.dataframe(input_data)
+    st.markdown("---")  # Separator
 
-with col2:
-    st.subheader("Prediction Result:")
-    if st.button("Predict Demand", key="predict_button", type="primary", use_container_width=True):
-        try:
-            # Scale the input data using the loaded V2 scaler
-            input_data_scaled = fitted_scaler.transform(input_data)
+    # --- Prediction Execution and Display ---
+    predict_col, result_col = st.columns([0.3, 0.7])
 
-            # Make prediction
-            prediction = trained_model.predict(input_data_scaled)
-            predicted_count = int(round(prediction[0]))  # Get the first prediction, round and convert to int
+    with predict_col:
+        predict_button = st.button("🚀 Predict Demand", key="predict_button", type="primary", use_container_width=True)
 
-            st.metric("Predicted Daily Bike Rentals", f"{predicted_count:,}")  # Format with comma
-            if predicted_count < 0:
-                st.warning(
-                    "Note: Prediction is negative, suggesting potentially unusual input conditions or model limitations.")
+    with result_col:
+        if predict_button:
+            # --- Derive features ---
+            derived_season_val = derive_season(inp_mnth)
+            derived_workingday_val = derive_workingday(inp_weekday, inp_holiday)
 
-        except Exception as e:
-            st.error(f"An error occurred during prediction: {e}")
-            st.exception(e)
-    else:
-        st.info("Click the 'Predict Demand' button to see the result.")
+            # --- Create input DataFrame IN THE CORRECT ORDER ---
+            input_dict = {
+                'mnth': inp_mnth,
+                'holiday': inp_holiday,
+                'weekday': inp_weekday,
+                'weathersit': inp_weathersit,
+                'temp_c': inp_temp_c,
+                'atemp_c': inp_atemp_c,
+                'hum_pct': inp_hum_pct,
+                'windspeed_kmh': inp_windspeed_kmh,
+                # Add derived values
+                'season': derived_season_val,
+                'workingday': derived_workingday_val
+            }
+            # Create DataFrame using the exact feature order model was trained on
+            input_data = pd.DataFrame([input_dict])[FEATURE_ORDER]
 
-# --- Optional: Show some data exploration ---
-st.markdown("---")
-st.subheader("Explore Processed Data")
-expander = st.expander("Click here to explore the data used for training")
-with expander:
-    st.write("Data preview (with de-normalized weather features):")
+            st.write("**Input Data for Model:**")
+            st.dataframe(input_data)
+
+            try:
+                # Scale the input data
+                input_data_scaled = fitted_scaler.transform(input_data)
+
+                # Make prediction
+                prediction = trained_model.predict(input_data_scaled)
+                predicted_count = int(round(prediction[0]))
+
+                st.metric("Predicted Daily Bike Rentals", f"{predicted_count:,}")
+                if predicted_count < 0:
+                    st.warning(
+                        "Note: Prediction is negative, suggesting potentially unusual input conditions or model limitations.")
+
+            except Exception as e:
+                st.error(f"An error occurred during prediction: {e}")
+                st.exception(e)
+        else:
+            st.info("Click the 'Predict Demand' button after adjusting inputs.")
+
+# --- Data Exploration Tab ---
+with tab2:
+    st.header("Explore Processed Training Data")
+    st.write("Data preview (with de-normalized weather features, 'yr' removed):")
     st.dataframe(data_processed_df.head())
 
-    st.write("Average Daily Rentals by Season:")
-    seasonal_rentals = data_processed_df.groupby('season')['cnt'].mean().reset_index()
-    seasonal_rentals['season_label'] = seasonal_rentals['season'].map(season_map)
-    st.bar_chart(seasonal_rentals.set_index('season_label')['cnt'])
+    st.divider()  # Visual separator
 
-    st.write("Average Daily Rentals by Weather Situation:")
-    weather_rentals = data_processed_df.groupby('weathersit')['cnt'].mean().reset_index()
-    weather_rentals['weather_label'] = weather_rentals['weathersit'].map(weather_map)
-    st.bar_chart(weather_rentals.set_index('weather_label')['cnt'])
+    c1, c2 = st.columns(2)
+    with c1:
+        st.write("Average Daily Rentals by Season:")
+        seasonal_rentals = data_processed_df.groupby('season')['cnt'].mean().reset_index()
+        # Use the display map for labels
+        season_map_rev = {v: k for k, v in season_map_display.items()}  # Need codes for mapping
+        seasonal_rentals['season_label'] = seasonal_rentals['season'].map(season_map_display)
+        st.bar_chart(seasonal_rentals.set_index('season_label')['cnt'])
+
+    with c2:
+        st.write("Average Daily Rentals by Weather Situation:")
+        weather_rentals = data_processed_df.groupby('weathersit')['cnt'].mean().reset_index()
+        weather_rentals['weather_label'] = weather_rentals['weathersit'].map(weather_map)
+        st.bar_chart(weather_rentals.set_index('weather_label')['cnt'])
