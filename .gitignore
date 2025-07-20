@@ -1,0 +1,7 @@
+data
+.venv
+gradient_boosting_model.joblib
+gradient_boosting_model_v2.joblib
+feature_names_v2.joblib
+scaler.joblib
+scaler_v2.joblib
